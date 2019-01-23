@@ -26,13 +26,20 @@ from keras.engine.topology import Layer, InputSpec
 from keras.layers import Input, Dense, Dropout
 from keras.models import Model, Sequential
 from keras.optimizers import SGD
-#from keras.utils.vis_utils import plot_model
+from keras.optimizers import adam
+from keras.losses import mean_squared_error
+from keras.losses import poisson
+from keras.utils.vis_utils import plot_model
 from keras.callbacks import EarlyStopping
 from sklearn.cluster import KMeans
 from math import ceil
 from time import time as get_time
 from ..utilities import _get_max_prob
+from ..models.losses import *
 
+#Activation functions for NB
+MeanAct = lambda x: tf.clip_by_value(K.exp(x), 1e-5, 1e6)
+DispAct = lambda x: tf.clip_by_value(tf.nn.softplus(x), 1e-4, 1e4)
 
 def train(data,
           dims,
@@ -51,6 +58,9 @@ def train(data,
           use_early_stop=True,
           use_ae_weights=False,
           save_encoder_weights=False,
+          loss="mse",
+          impute=True,
+          clust_weight=1,
           save_dir='tmp_result',
           max_iter=1000,
           epochs_fit=4,
@@ -60,6 +70,7 @@ def train(data,
           verbose=True,
           ):
 
+    # Casting data input
     if isinstance(data, AnnData):
         adata = data
     else:
@@ -68,10 +79,12 @@ def train(data,
     assert dims[0] == adata.shape[-1], \
         'The number of columns of data needs to be equal to the first element of dims!'
 
+    # Set seed
     random.seed(random_seed)
     np.random.seed(random_seed)
     tf.set_random_seed(random_seed)
 
+    # Hardware stuff
     total_cpu = multiprocessing.cpu_count()
     num_cores = int(num_cores) if total_cpu > int(num_cores) else int(ceil(total_cpu / 2))
     print('The number of threads in your computer is', total_cpu)
@@ -83,6 +96,8 @@ def train(data,
         os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
         kb.set_session(tf.Session(config=tf.ConfigProto(intra_op_parallelism_threads=num_cores,
                                                         inter_op_parallelism_threads=num_cores)))
+
+    # Remove the old weights so new ones are computed if not using old weights...?
     if not use_ae_weights and os.path.isfile(os.path.join(save_dir, "ae_weights.h5")):
         os.remove(os.path.join(save_dir, "ae_weights.h5"))
 
@@ -108,10 +123,13 @@ def train(data,
                      use_earlyStop=use_early_stop,
                      use_ae_weights=use_ae_weights,
                      save_encoder_weights=save_encoder_weights,
+                     loss=loss,
+                     impute=impute,
+                     clust_weight=clust_weight,
                      save_dir=save_dir
                      )
 
-    desc.compile(optimizer=SGD(0.01, 0.9), loss='kld')
+    desc.compile(optimizer='rmsprop')
     embedded, prob = desc.fit(maxiter=max_iter, epochs_fit=epochs_fit)
     print("The desc has been trained successfully!!!!!!")
     if verbose:
@@ -122,7 +140,7 @@ def train(data,
     adata.obsm['prob'] = prob
     adata.obs['ident'] = np.argmax(prob, axis=1)
     adata.obs['max_prob'] = _get_max_prob(prob)
-    return adata
+    return adata, desc.model
 
 
 class ClusteringLayer(Layer):
@@ -186,6 +204,25 @@ class ClusteringLayer(Layer):
         return dict(list(base_config.items()) + list(config.items()))
 
 
+class SliceLayer(Layer):
+    def __init__(self, index, **kwargs):
+        self.index = index
+        super().__init__(**kwargs)
+
+    def build(self, input_shape):
+        if not isinstance(input_shape, list):
+            raise ValueError('Input should be a list')
+
+        super().build(input_shape)
+
+    def call(self, x):
+        assert isinstance(x, list), 'SliceLayer input is not a list'
+        return x[self.index]
+
+    def compute_output_shape(self, input_shape):
+        return input_shape[self.index]
+
+
 class DescModel(object):
     def __init__(self,
                  dims,
@@ -206,6 +243,9 @@ class DescModel(object):
                  use_earlyStop=True,
                  use_ae_weights=False,
                  save_encoder_weights=False,
+                 loss="mse",
+                 impute=True,
+                 clust_weight=1,
                  save_dir=None # save result to save_dir, the default is "result". if recurvie path, there root dir must be exists, or there will be something wrong: for example : "/result_singlecell/dataset1" will return wrong if "result_singlecell" not exist
                  ):
 
@@ -232,6 +272,10 @@ class DescModel(object):
         self.use_earlyStop=use_earlyStop
         self.use_ae_weights=use_ae_weights
         self.save_encoder_weights=save_encoder_weights
+        self.loss=loss
+        self.impute=impute
+        self.clust_weight=clust_weight
+        self.ae_loss=None
         self.save_dir=save_dir
         # set random seed
         random.seed(random_seed)
@@ -249,8 +293,11 @@ class DescModel(object):
                 random_seed=self.random_seed,
                 actincenter=self.actincenter,
                 init=self.init,
-                use_earlyStop=self.use_earlyStop
+                use_earlyStop=self.use_earlyStop,
+                loss=self.loss
                 )
+        self.ae_loss=sae.loss_fun
+
         # begin pretraining
         t0 = get_time()
         print("Checking whether %s  exists in the directory"%str(os.path.join(self.save_dir,'ae_weights,h5')))
@@ -310,8 +357,16 @@ class DescModel(object):
             self.n_clusters=cluster_centers.shape[0]
             self.init_centroid=[cluster_centers]
         # create desc clustering layer
-        clustering_layer = ClusteringLayer(self.n_clusters,weights=self.init_centroid,name='clustering')(self.encoder.output)
-        self.model = Model(inputs=self.encoder.input, outputs=clustering_layer)
+
+        if self.impute:
+            clustering_layer = ClusteringLayer(self.n_clusters,weights=self.init_centroid,name='clustering')(self.encoder.output)
+            self.model = Model(inputs=self.autoencoder.input, outputs=[clustering_layer,self.autoencoder.output])
+        else:
+            clustering_layer = ClusteringLayer(self.n_clusters, weights=self.init_centroid, name='clustering')(self.encoder.output)
+            self.model = Model(inputs=self.encoder.input, outputs=clustering_layer)
+
+        print("Printing autoencoder visualization.")
+        plot_model(self.model, show_shapes=True, to_file='autoencoders.png')
 
     def load_weights(self, weights):  # load weights of DEC model
         self.model.load_weights(weights)
@@ -328,8 +383,13 @@ class DescModel(object):
         weight = q ** 2 / q.sum(0)
         return (weight.T / weight.sum(1)).T
 
-    def compile(self, optimizer='sgd', loss='kld'):
-        self.model.compile(optimizer=optimizer, loss=loss)
+    def compile(self, optimizer='sgd'):
+        if self.impute:
+            self.model.compile(loss={'clustering': 'kld', 'output': self.ae_loss},
+                               loss_weights=[self.clust_weight, 1],
+                               optimizer=optimizer)
+        else:
+            self.model.compile(optimizer=optimizer, loss='kld')
 
     def fit(self, maxiter=1e3, epochs_fit=5):  # unsupervised
         save_dir=self.save_dir
@@ -341,7 +401,11 @@ class DescModel(object):
             if self.save_encoder_weights and ite%5==0: #save ae_weights for every 20 iterations
                 self.encoder.save_weights(os.path.join(self.save_dir,'encoder_weights_'+str(ite)+'.h5'))
                 print('Fine tuning encoder weights are saved to %s/encoder_weights.h5' % self.save_dir)
-            q = self.model.predict(self.x, verbose=0)
+            if self.impute:
+                q,_ = self.model.predict(self.x, verbose=0)
+            else:
+                q = self.model.predict(self.x, verbose=0)
+
             p = self.target_distribution(q)  # update the auxiliary target distribution p
             # evaluate the clustering performance
             y_pred = q.argmax(1)
@@ -354,11 +418,16 @@ class DescModel(object):
                 break
             print("The value of delta_label of current",str(ite+1),"th iteration is",delta_label,">= tol",self.tol)
             #train on whole dataset on prespecified batch_size
+            if self.impute:
+                y = [p,self.x]
+            else:
+                y = p
+
             if self.use_earlyStop:
                 callbacks=[EarlyStopping(monitor='loss',min_delta=1e-4,patience=5,verbose=1,mode='auto')]
-                self.model.fit(x=self.x,y=p,epochs=epochs_fit,batch_size=self.batch_size,callbacks=callbacks,shuffle=True,verbose=True)
+                self.model.fit(x=self.x,y=y,epochs=epochs_fit,batch_size=self.batch_size,callbacks=callbacks,shuffle=True,verbose=True)
             else:
-                self.model.fit(x=self.x,y=p,epochs=epochs_fit,batch_size=self.batch_size,shuffle=True,verbose=True)
+                self.model.fit(x=self.x,y=y,epochs=epochs_fit,batch_size=self.batch_size,shuffle=True,verbose=True)
         #save encoder model
         self.encoder.save(os.path.join(self.save_dir, "encoder_model.h5"))
         #load model
@@ -395,15 +464,17 @@ class SAE(object):
         drop_rate: drop ratio of Dropout for constructing denoising autoencoder 'stack_i' during layer-wise pretraining
         batch_size: batch size
     """
-    def __init__(self, dims, act='relu', drop_rate=0.2, batch_size=32,random_seed=201809,actincenter="tanh",init="glorot_uniform",use_earlyStop=True,save_dir='result_tmp'): #act relu
+    def __init__(self, dims, act='relu', drop_rate=0.2, batch_size=32,random_seed=201809,actincenter="tanh",init="glorot_uniform",use_earlyStop=True,loss="mse",save_dir='result_tmp'):
         self.dims = dims
         self.n_stacks = len(dims) - 1
         self.n_layers = 2*self.n_stacks  # exclude input layer
         self.activation = act
-        self.actincenter=actincenter #linear
+        self.actincenter=actincenter #hidden layer activation function
         self.drop_rate = drop_rate
         self.init=init
         self.batch_size = batch_size
+        self.loss = loss
+        self.loss_fun = None #This is adjusted once the autoencoder is made via make_autoencoder
         #set random seed
         random.seed(random_seed)
         np.random.seed(random_seed)
@@ -412,9 +483,9 @@ class SAE(object):
         self.use_earlyStop=use_earlyStop
         self.stacks = [self.make_stack(i) for i in range(self.n_stacks)]
         self.autoencoders ,self.encoder= self.make_autoencoders()
-        #plot_model(self.autoencoders, show_shapes=True, to_file='autoencoders.png')
 
-    def make_autoencoders(self):
+
+    def make_autoencoders(self,type="mse"):
         """ Fully connected autoencoders model, symmetric.
         """
         # input
@@ -426,17 +497,46 @@ class SAE(object):
             h = Dense(self.dims[i + 1], kernel_initializer=self.init,activation=self.activation, name='encoder_%d' % i)(h)
 
         # hidden layer,default activation is linear
-        h = Dense(self.dims[-1],kernel_initializer=self.init, name='encoder_%d' % (self.n_stacks - 1),activation=self.actincenter)(h)  # features are extracted from here
+        h = Dense(self.dims[-1],kernel_initializer=self.init, name='embedding',activation=self.actincenter)(h)  # features are extracted from here
 
         y=h
         # internal layers in decoder       
         for i in range(self.n_stacks-1, 0, -1):
-            y = Dense(self.dims[i], kernel_initializer=self.init,activation=self.activation, name='decoder_%d' % i)(y)
+            y = Dense(self.dims[i], kernel_initializer=self.init,activation=self.activation, name='decoder_%d' % (i-1))(y)
 
         # output
-        y = Dense(self.dims[0], kernel_initializer=self.init,name='decoder_0',activation=self.actincenter)(y)
+        if self.loss=="mse":
+            y = self.make_final_layer_mse(y)
+        if self.loss=="nb":
+            y = self.make_final_layer_nb(y)
+        if self.loss=="poisson":
+            y = self.make_final_layer_poisson(y)
 
         return Model(inputs=x, outputs=y,name="AE"),Model(inputs=x,outputs=h,name="encoder")
+
+    def make_final_layer_mse(self,y):
+        print("Created autoencoder with mean squared error loss.")
+        self.loss_fun = mean_squared_error
+        return Dense(self.dims[0], kernel_initializer=self.init,name='output',activation=self.actincenter)(y)
+
+    def make_final_layer_nb(self,y):
+        print("Created autoencoder with negative binomial loss.")
+        disp = Dense(self.dims[0], activation=DispAct, name='dispersion')(y)
+
+        mean = Dense(self.dims[0], activation=MeanAct, name='mean')(y)
+
+        # Set the parameters of the NB
+        nb = NB(theta=disp)
+        self.loss_fun = nb.loss
+
+        output = SliceLayer(0, name='output')([mean, disp])
+
+        return output
+
+    def make_final_layer_poisson(self,y):
+        print("Created autoencoder with mean squared error loss.")
+        self.loss_fun = poisson
+        return Dense(self.dims[0], kernel_initializer=self.init,name='output',activation=MeanAct)(y)
 
     def make_stack(self, ith):
         """ 
@@ -514,10 +614,11 @@ class SAE(object):
         self.pretrain_autoencoders(x, epochs=epochs)
 
     def fit2(self,x,epochs=300): #no stack directly traning 
-        for j in range(math.ceil(epochs/50)):
+        for j in range(1):#range(math.ceil(epochs/50)):
             lr = pow(10, -j)
             print ('learning rate =', lr)
-            self.autoencoders.compile(optimizer=SGD(lr, momentum=0.9), loss='mse')
+            #print(self.loss_fun)
+            self.autoencoders.compile(optimizer='rmsprop', loss=self.loss_fun)
             if self.use_earlyStop:
                 callbacks=[EarlyStopping(monitor='loss',min_delta=1e-4,patience=10,verbose=1,mode='auto')]
                 self.autoencoders.fit(x=x,y=x,callbacks=callbacks,batch_size=self.batch_size,epochs=epochs)

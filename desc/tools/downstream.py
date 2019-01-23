@@ -23,5 +23,6 @@ def run_tsne(
         plt.title("tSNE plot")
         plt.xlabel("tSNE_1")
         plt.ylabel("tSNE_2")
+        plt.savefig("test_tsne.png")
 
     return tsne if return_tsne else None

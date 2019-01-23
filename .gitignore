@@ -1,0 +1,6 @@
+tmp_result/
+*.png
+cache/
+write/
+MANIFEST.in
+.Rhistory
